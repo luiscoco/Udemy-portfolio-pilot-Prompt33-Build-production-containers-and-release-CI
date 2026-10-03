@@ -1,4 +1,4 @@
-# PortfolioPilot — Milestone 33: Production Containers and Release CI
+# Production Containers and Release CI
 
 PortfolioPilot is a teaching project: a stock portfolio manager with a live news feed and an AI
 assistant built on the Claude Agent SDK. It is built one milestone at a time (36 in total). This
