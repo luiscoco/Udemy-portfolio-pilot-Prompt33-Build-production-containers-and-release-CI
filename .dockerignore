@@ -1,0 +1,50 @@
+# Milestone 33. The build context is an allowlist of source; everything else stays on the host.
+# Secrets, local transcripts and personal agent settings must never reach a build stage, because a
+# later COPY, a cached layer or a Next/Vite build reading `.env*` could embed them in an image.
+*
+!package.json
+!package-lock.json
+!.npmrc
+!tsconfig.base.json
+!apps/
+!packages/
+!docker/
+
+# Credentials and local configuration, including the committed examples (images take config at run time).
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+
+# Agent transcripts, session artifacts and personal or generated agent instructions.
+**/.claude
+**/.claude-agent-sdk
+**/.codex
+**/.agents
+**/.local
+**/sdk-transcripts
+**/*.transcript.jsonl
+**/AGENTS.md
+**/CLAUDE.md
+
+# Host build output, dependencies and test artefacts: images rebuild from the lockfile on Linux.
+**/node_modules
+**/dist
+**/.next
+**/next-env.d.ts
+**/*.tsbuildinfo
+**/coverage
+**/test-results
+**/playwright-report
+**/generated
+**/.npm-cache
+**/.cache
+
+# Tests, end-to-end suites and evaluation data are run by CI, not shipped.
+apps/web/e2e
+apps/*/test
+apps/api/lib/testing
+packages/*/test
+apps/web/playwright.config.ts
+**/*.test.ts
+**/*.spec.ts

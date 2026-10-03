@@ -1,0 +1,43 @@
+name: portfolio-pilot-local
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: portfolio_local
+      POSTGRES_PASSWORD: local_only_change_me
+      POSTGRES_DB: portfolio_pilot
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portfolio_local -d portfolio_pilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+  redis:
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+  # Optional local trace UI (milestone 32): `docker compose --profile observability up -d jaeger`, then run
+  # processes with OTEL_TRACES_EXPORTER=otlp and OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318.
+  # UI: http://127.0.0.1:16686. In-memory storage only; nothing leaves this machine.
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    profiles: ["observability"]
+    ports:
+      - "127.0.0.1:16686:16686"
+      - "127.0.0.1:4318:4318"
+volumes:
+  postgres_data:
+  redis_data:

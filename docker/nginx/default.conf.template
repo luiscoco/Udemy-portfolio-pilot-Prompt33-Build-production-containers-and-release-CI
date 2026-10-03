@@ -1,0 +1,99 @@
+# PortfolioPilot single public origin (milestone 33): `/api/*` goes to the Next.js API, every other
+# path serves the static React build with SPA fallback. Rendered at container start by the image's
+# envsubst entrypoint; only variables defined in the environment are replaced (not $uri, $host, ...).
+#   API_UPSTREAM          host:port of the API service (Compose: api:3001; Kubernetes: the API Service)
+#   NGINX_LOCAL_RESOLVERS filled by the entrypoint from /etc/resolv.conf (Docker and Kubernetes DNS)
+# In AKS the gateway may route /api straight to the API (milestone 35); this proxy then sees no traffic.
+
+# Re-resolve the API name so a restarted or rescheduled API container is found again.
+resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+resolver_timeout 3s;
+
+upstream portfolio_api {
+    zone portfolio_api 64k;
+    server ${API_UPSTREAM} resolve;
+    keepalive 16;
+}
+
+server {
+    listen 8080;
+    listen [::]:8080;
+    server_name _;
+    server_tokens off;
+    root /usr/share/nginx/html;
+    charset utf-8;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript text/javascript application/json image/svg+xml;
+
+    # Container health only (no dependency checks): the API's readiness is probed separately.
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location ^~ /api/ {
+        proxy_pass http://portfolio_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # The browser's origin, unchanged, so authentication origin checks match AUTH_BASE_URL.
+        proxy_set_header Host $http_host;
+        # Replaced, not appended: a client cannot spoof the address the API sees.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Server-Sent Events (/api/events): stream every frame immediately and keep idle streams open
+        # longer than the API's heartbeat. Non-idempotent requests are never retried (nginx default).
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_connect_timeout 5s;
+        client_max_body_size 1m;
+        # nginx's own failures (API unreachable or timed out) in the application's JSON error shape. The
+        # API's responses, including its "not processed" 503 while draining, pass through unchanged.
+        error_page 502 504 = @api_unavailable;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    location @api_unavailable {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/security-headers.conf;
+        # The request may have reached the API before the connection failed, so it is not called "not processed".
+        return 502 '{"error":{"code":"SERVICE_UNAVAILABLE","message":"The server connection was lost. Refresh to check whether your last change was saved before retrying.","requestId":"$request_id"}}';
+    }
+
+    location = /api {
+        default_type application/json;
+        include /etc/nginx/snippets/security-headers.conf;
+        return 404 '{"error":{"code":"NOT_FOUND","message":"Not found."}}';
+    }
+
+    # Content-hashed build assets: cache forever; a missing asset is a 404, never index.html.
+    location ^~ /assets/ {
+        try_files $uri =404;
+        # Without "always": only successful responses are cacheable, never a 404.
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Any other path with a file extension is a file request, not an application route.
+    location ~* \.[a-z0-9]+$ {
+        try_files $uri =404;
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # SPA fallback: client-side routes (e.g. /portfolios/123) receive index.html, revalidated each time
+    # so a new release is picked up immediately.
+    location / {
+        try_files $uri /index.html;
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+}

@@ -1,0 +1,141 @@
+# Continuous integration (milestone 33): lockfile install, checks, the three test suites, the mock
+# evaluation, and the release images (built, scanned and smoke-tested, never pushed).
+# Publishing and deployment live in release.yml behind environment approval and OIDC.
+#
+# Third-party actions are pinned to full commit SHAs (the tag is in the trailing comment).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repository, packages or a cloud.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NPM_CONFIG_UPDATE_NOTIFIER: "false"
+  NPM_CONFIG_FUND: "false"
+  NEXT_TELEMETRY_DISABLED: "1"
+  # The mock paths need no credentials; make sure none can leak in from the environment.
+  ANTHROPIC_API_KEY: ""
+
+jobs:
+  checks:
+    name: Install, build, typecheck, unit tests, mock evaluation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version-file: .nvmrc, cache: npm }
+      # Exactly the committed lockfile; lifecycle scripts stay disabled as in local installs.
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run check:browser-boundary
+      - run: npm run test:proxy
+      - run: npm run test:unit
+      - run: npm run eval:mock
+
+  integration:
+    name: Integration tests (PostgreSQL + Redis)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version-file: .nvmrc, cache: npm }
+      - run: npm ci --ignore-scripts
+      # Disposable, labelled postgres/redis containers per run (scripts/test-support/infra.mjs).
+      - run: npm run test:integration
+
+  browser:
+    name: Browser tests (Chrome, two API replicas)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version-file: .nvmrc, cache: npm }
+      - run: npm ci --ignore-scripts
+      # Uses the runner's Google Chrome (channel: chrome). The outage phase stops and restarts its own
+      # database containers, which is why the suite owns Docker containers instead of CI services.
+      - run: npm run test:browser
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-test-results
+          path: apps/web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  images:
+    name: Images (linux/amd64) - build, scan, containerized smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      # The scan and smoke scripts use only Node built-ins (no npm install), but need Node 24.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version-file: .nvmrc }
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build web
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: { context: ., file: docker/web.Dockerfile, platforms: linux/amd64, load: true, push: false, tags: "portfolio-pilot-web:ci",
+                cache-from: "type=gha,scope=web-amd64", cache-to: "type=gha,scope=web-amd64,mode=max" }
+      - name: Build api
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: { context: ., file: docker/api.Dockerfile, platforms: linux/amd64, load: true, push: false, tags: "portfolio-pilot-api:ci",
+                cache-from: "type=gha,scope=api-amd64", cache-to: "type=gha,scope=api-amd64,mode=max" }
+      - name: Build worker
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: { context: ., file: docker/worker.Dockerfile, platforms: linux/amd64, load: true, push: false, tags: "portfolio-pilot-worker:ci",
+                cache-from: "type=gha,scope=worker-amd64", cache-to: "type=gha,scope=worker-amd64,mode=max" }
+      - name: Build migrate
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: { context: ., file: docker/migrate.Dockerfile, platforms: linux/amd64, load: true, push: false, tags: "portfolio-pilot-migrate:ci",
+                cache-from: "type=gha,scope=migrate-amd64", cache-to: "type=gha,scope=migrate-amd64,mode=max" }
+      - name: Scanner self-test (planted violations must be detected)
+        run: node scripts/inspect-images.mjs --tag ci --self-test
+      - name: Inspect layers, config, history and browser assets
+        run: node scripts/inspect-images.mjs --tag ci --json image-inspection.json
+      - name: Containerized mock smoke test
+        run: node scripts/verify-containers.mjs --skip-build
+        env: { PORTFOLIO_PILOT_TAG: ci }
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with: { name: image-inspection, path: image-inspection.json, retention-days: 14, if-no-files-found: ignore }
+
+  images-arm64:
+    name: Images (linux/arm64) - native build with the SDK runtime gate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [web, api, worker, migrate]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Native arm64 (no emulation): the Dockerfiles' gate executes the arm64 Claude Code CLI.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/${{ matrix.image }}.Dockerfile
+          platforms: linux/arm64
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}-arm64
+          cache-to: type=gha,scope=${{ matrix.image }}-arm64,mode=max

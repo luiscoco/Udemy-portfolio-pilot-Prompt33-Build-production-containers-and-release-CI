@@ -1,0 +1,13 @@
+export { redactLog, logMetadata } from './redaction.js';
+export { actorRef, exportableAttributes, isExportableAttribute, labelValue, METRIC_LABEL_KEYS, resetActorKey, safeAttributes, safeLabels } from './attributes.js';
+export type { MetricLabelKey, MetricLabels, SafeAttributes } from './attributes.js';
+export { activeTraceparent, annotate, contextFromTraceparent, currentTraceIds, initTelemetry, inSpan, linkFromTraceparent, recordFailure, resetTelemetryForTests, startSpan, tracer, TRACER_NAME } from './telemetry.js';
+export type { SpanOptions, TelemetryHandle, TelemetryOptions } from './telemetry.js';
+export { JsonLinesSpanExporter, toSpanRecord } from './file-exporter.js';
+export { SanitizingSpanExporter } from './sanitizing-exporter.js';
+export type { SpanRecord } from './file-exporter.js';
+export { metric } from './metrics.js';
+export { createLogger } from './logger.js';
+export type { Logger, LogFields, LogLevel } from './logger.js';
+export { readTraceDirectory, traceTree } from './inspect.js';
+export type { Span } from '@opentelemetry/api';

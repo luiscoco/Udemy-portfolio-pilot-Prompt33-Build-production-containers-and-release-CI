@@ -1,0 +1,160 @@
+# Production-like local stack (milestone 33): the release images, read-only root filesystems, non-root
+# users, no Linux capabilities, a single public origin (http://localhost:8080) and deterministic mocks.
+#
+#   PORTFOLIO_PILOT_AUTH_SECRET=<32+ random characters> docker compose -f compose.production.yaml up -d --build --wait
+#   open http://localhost:8080            (demo sign-in: alice or bob)
+#   docker compose -f compose.production.yaml down -v
+#
+# Images are production builds (NODE_ENV=production by default). This file opts into the LOCAL DEMO
+# PROFILE explicitly (NODE_ENV=development, DEMO_AUTH_ENABLED=true): the server config still refuses demo
+# authentication unless the public origin is loopback, and refuses it outright when NODE_ENV=production.
+# Nothing is published except the web origin on 127.0.0.1. `npm run verify:containers` runs this stack.
+name: portfolio-pilot-prodlike
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+
+x-app-env: &app-env
+  NODE_ENV: development
+  DATA_MODE: mock
+  AGENT_MODE: mock
+  DEMO_AUTH_ENABLED: "true"
+  AUTH_BASE_URL: http://localhost:8080
+  # No default: with INSTANCE_ID set, the API and workers refuse to start without one shared secret.
+  AUTH_SECRET: ${PORTFOLIO_PILOT_AUTH_SECRET:-}
+  DATABASE_URL: postgresql://portfolio:${PORTFOLIO_PILOT_DB_PASSWORD:-local_only_change_me}@postgres:5432/portfolio_pilot
+  REDIS_URL: redis://redis:6379
+  MOCK_NEWS_INTERVAL_MS: ${MOCK_NEWS_INTERVAL_MS:-30000}
+  INGESTION_INTERVAL_MS: ${INGESTION_INTERVAL_MS:-30000}
+  AGENT_MOCK_STREAM_DELAY_MS: ${AGENT_MOCK_STREAM_DELAY_MS:-25}
+  LOG_LEVEL: info
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: portfolio
+      POSTGRES_PASSWORD: ${PORTFOLIO_PILOT_DB_PASSWORD:-local_only_change_me}
+      POSTGRES_DB: portfolio_pilot
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portfolio -d portfolio_pilot"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    image: portfolio-pilot-migrate:${PORTFOLIO_PILOT_TAG:-local}
+    build: { context: ., dockerfile: docker/migrate.Dockerfile }
+    <<: *hardening
+    environment:
+      DATABASE_URL: postgresql://portfolio:${PORTFOLIO_PILOT_DB_PASSWORD:-local_only_change_me}@postgres:5432/portfolio_pilot
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  # Synthetic demo users and portfolios (local profile only). The seed refuses non-loopback databases,
+  # so it joins PostgreSQL's network namespace and really connects over 127.0.0.1.
+  seed-demo:
+    image: portfolio-pilot-worker:${PORTFOLIO_PILOT_TAG:-local}
+    <<: *hardening
+    network_mode: service:postgres
+    environment:
+      NODE_ENV: development
+      ALLOW_DEMO_SEED: "true"
+      DATABASE_URL: postgresql://portfolio:${PORTFOLIO_PILOT_DB_PASSWORD:-local_only_change_me}@127.0.0.1:5432/portfolio_pilot
+    command: ["node", "packages/db/dist/seed-cli.js"]
+    healthcheck: { disable: true }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: "no"
+
+  api:
+    image: portfolio-pilot-api:${PORTFOLIO_PILOT_TAG:-local}
+    build: { context: ., dockerfile: docker/api.Dockerfile }
+    <<: *hardening
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      # Writable SDK workspace (live article analysis), separate from the read-only application code.
+      - /var/lib/portfolio-pilot/agent-workspace:size=64m,uid=10001,gid=10001,mode=0700
+    environment:
+      <<: *app-env
+      INSTANCE_ID: api-1
+      API_SHUTDOWN_GRACE_MS: "20000"
+    depends_on:
+      seed-demo: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    # Docker's stop timeout must exceed the API's own drain deadline.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  worker-ingestion:
+    image: portfolio-pilot-worker:${PORTFOLIO_PILOT_TAG:-local}
+    build: { context: ., dockerfile: docker/worker.Dockerfile }
+    <<: *hardening
+    environment: { <<: *app-env, WORKER_ROLE: ingestion, INSTANCE_ID: ingestion-1 }
+    depends_on:
+      seed-demo: { condition: service_completed_successfully }
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+  worker-outbox:
+    image: portfolio-pilot-worker:${PORTFOLIO_PILOT_TAG:-local}
+    <<: *hardening
+    environment: { <<: *app-env, WORKER_ROLE: outbox, INSTANCE_ID: outbox-1, OUTBOX_POLL_MS: "250" }
+    depends_on:
+      seed-demo: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+  worker-agent:
+    image: portfolio-pilot-worker:${PORTFOLIO_PILOT_TAG:-local}
+    <<: *hardening
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      # Ephemeral SDK workspace (CLAUDE_CONFIG_DIR/cwd): recreated empty on every start.
+      - /var/lib/portfolio-pilot/agent-workspace:size=256m,uid=10001,gid=10001,mode=0700
+    volumes:
+      # Durable private session snapshots (milestone 28 local backend); Azure Blob in production.
+      - session_artifacts:/var/lib/portfolio-pilot/session-artifacts
+    environment: { <<: *app-env, WORKER_ROLE: agent, INSTANCE_ID: agent-1 }
+    depends_on:
+      seed-demo: { condition: service_completed_successfully }
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+  web:
+    image: portfolio-pilot-web:${PORTFOLIO_PILOT_TAG:-local}
+    build: { context: ., dockerfile: docker/web.Dockerfile }
+    <<: *hardening
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      # The entrypoint renders default.conf.template here at start.
+      - /etc/nginx/conf.d:size=1m,uid=101,gid=101,mode=0755
+    environment:
+      API_UPSTREAM: api:3001
+    ports:
+      - "127.0.0.1:8080:8080"   # must match AUTH_BASE_URL
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  session_artifacts:

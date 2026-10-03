@@ -1,0 +1,144 @@
+# Release (milestone 33): publish the four images to Azure Container Registry, then deploy.
+# NOTHING RUNS until a maintainer deliberately enables it - milestone 33 does not publish or deploy:
+#   1. Manual trigger only (workflow_dispatch), from main, and only when the repository variable
+#      RELEASE_ENABLED is "true".
+#   2. Every job that touches the cloud names a GitHub environment. Configure each with required
+#      reviewers (explicit approval) and a main-only deployment branch rule:
+#        release-registry  - pushes images            production - deploys (milestone 35)
+#   3. Cloud access is OpenID Connect workload identity federation only: `id-token: write` lets
+#      azure/login exchange GitHub's short-lived token for an Entra token. No client secret, registry
+#      password or kubeconfig is stored anywhere. Identifiers (not secrets) are environment variables:
+#        AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, ACR_NAME (+ AKS_* for production).
+#      The federated credential's subject must name the environment, e.g.
+#        repo:<owner>/<repo>:environment:release-registry
+# Images are pushed by digest per architecture (native runners), merged into one multi-arch tag
+# (the commit SHA, never "latest") and given build-provenance attestations.
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Publish ${{ matrix.image }} (${{ matrix.platform }})
+    if: github.ref == 'refs/heads/main' && vars.RELEASE_ENABLED == 'true'
+    environment: release-registry
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: [web, api, worker, migrate]
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # Exchanges the Entra token for a short-lived ACR token (requires AcrPush on the registry only).
+      - run: az acr login --name "${{ vars.ACR_NAME }}"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/${{ matrix.image }}.Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ vars.ACR_NAME }}.azurecr.io/portfolio-pilot/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Record digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.image }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+          path: digests/*
+          retention-days: 7
+
+  manifest:
+    name: Multi-arch tag and attestation (${{ matrix.image }})
+    needs: build-and-push
+    environment: release-registry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        image: [web, api, worker, migrate]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { pattern: "digest-${{ matrix.image }}-*", path: digests, merge-multiple: true }
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: az acr login --name "${{ vars.ACR_NAME }}"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: merge
+        name: Create the immutable commit tag from both architectures
+        env:
+          REPOSITORY: ${{ vars.ACR_NAME }}.azurecr.io/portfolio-pilot/${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$REPOSITORY:${GITHUB_SHA}" \
+            "$REPOSITORY@$(cat digests/${{ matrix.image }}-amd64)" "$REPOSITORY@$(cat digests/${{ matrix.image }}-arm64)"
+          digest=$(docker buildx imagetools inspect "$REPOSITORY:${GITHUB_SHA}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$REPOSITORY@$digest" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ vars.ACR_NAME }}.azurecr.io/portfolio-pilot/${{ matrix.image }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    name: Deploy to AKS (milestone 35)
+    needs: manifest
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Confirm the release images exist
+        run: |
+          set -euo pipefail
+          for image in web api worker migrate; do
+            az acr manifest show-metadata --registry "${{ vars.ACR_NAME }}" --name "portfolio-pilot/$image:${GITHUB_SHA}" --query digest -o tsv
+          done
+      # Milestone 35 replaces this step with: migration Job (migrate image) -> wait -> rollout of web, API
+      # and worker roles by digest -> smoke test. Until then the job stops here, deploying nothing.
+      - name: Roll out
+        run: |
+          echo "::error::Kubernetes manifests and the migration Job are delivered in milestone 35. Nothing was deployed."
+          exit 1

@@ -1,0 +1,63 @@
+# OpenTelemetry Collector -> Azure Monitor native OTLP ingestion (milestone 32; deployed in milestones 34-35).
+# PortfolioPilot processes export OTLP/HTTP to this collector only; they hold no Azure credentials.
+# Requires otel/opentelemetry-collector-contrib >= 0.148.0 (azure_auth syntax); pinned image: 0.161.0.
+# Values in ${env:...} come from the collector's deployment (see docs/lessons/32-ai-evaluation-and-observability.md):
+#   AZURE_MONITOR_TRACES_ENDPOINT   https://<logs-dce>/datacollectionRules/<dcr-immutable-id>/streams/Microsoft-OTLP-Traces/otlp/v1/traces
+#   AZURE_MONITOR_LOGS_ENDPOINT     https://<logs-dce>/datacollectionRules/<dcr-immutable-id>/streams/Microsoft-OTLP-Logs/otlp/v1/logs
+#   AZURE_MONITOR_METRICS_ENDPOINT  https://<metrics-dce>/datacollectionRules/<dcr-immutable-id>/streams/microsoft-otelmetrics/otlp/v1/metrics
+# The collector's identity (AKS workload identity) needs "Monitoring Metrics Publisher" on the DCR.
+receivers:
+  otlp:
+    protocols:
+      http:
+        # Inside the cluster only (ClusterIP service); never exposed publicly.
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  # Application Insights experiences expect delta temporality; the apps already send delta when
+  # OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta. This converts anything cumulative.
+  cumulativetodelta:
+  # Defence in depth: the apps never send these, but no URL, query or user field may reach Azure.
+  attributes/scrub:
+    actions:
+      - { key: http.target, action: delete }
+      - { key: url.full, action: delete }
+      - { key: url.query, action: delete }
+      - { key: http.url, action: delete }
+      - { key: enduser.id, action: delete }
+      - { key: db.statement, action: delete }
+      - { key: db.query.text, action: delete }
+  batch:
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  azure_auth:
+    # Workload identity in AKS (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE injected).
+    use_default: true
+    scopes:
+      - https://monitor.azure.com/.default
+
+exporters:
+  otlphttp/azuremonitor:
+    traces_endpoint: ${env:AZURE_MONITOR_TRACES_ENDPOINT}
+    logs_endpoint: ${env:AZURE_MONITOR_LOGS_ENDPOINT}
+    metrics_endpoint: ${env:AZURE_MONITOR_METRICS_ENDPOINT}
+    auth:
+      authenticator: azure_auth
+
+service:
+  extensions: [health_check, azure_auth]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/scrub, batch]
+      exporters: [otlphttp/azuremonitor]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, cumulativetodelta, batch]
+      exporters: [otlphttp/azuremonitor]

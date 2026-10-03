@@ -1,0 +1,45 @@
+{
+  "name": "portfolio-pilot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.21.0 <25",
+    "npm": ">=11.19.0 <12"
+  },
+  "packageManager": "npm@11.19.0",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "infra:start": "node scripts/infra.mjs start",
+    "infra:stop": "node scripts/infra.mjs stop",
+    "infra:status": "node scripts/infra.mjs status",
+    "infra:inspect": "node scripts/infra.mjs inspect",
+    "infra:reset": "node scripts/infra.mjs reset",
+    "build": "node scripts/run-workspaces.mjs build",
+    "typecheck": "node scripts/run-workspaces.mjs typecheck",
+    "build:types": "node scripts/run-workspaces.mjs build:types",
+    "lint": "node scripts/run-workspaces.mjs lint",
+    "test": "node scripts/run-workspaces.mjs test",
+    "test:unit": "node scripts/test-unit.mjs",
+    "test:integration": "node scripts/test-integration.mjs",
+    "test:browser": "node scripts/test-browser.mjs",
+    "eval:mock": "npm run build --workspace @portfolio-pilot/agent --silent && node packages/agent/dist/eval/cli.js --mode mock",
+    "eval:live": "npm run build --workspace @portfolio-pilot/agent --silent && node packages/agent/dist/eval/cli.js --mode live",
+    "trace:inspect": "node scripts/trace-inspect.mjs",
+    "check:browser-boundary": "node scripts/check-browser-boundary.mjs",
+    "distributed:local": "node scripts/distributed-local.mjs",
+    "verify:distributed": "node scripts/verify-distributed.mjs",
+    "test:proxy": "node --test scripts/local-proxy.test.mjs",
+    "verify:containers": "node scripts/verify-containers.mjs",
+    "inspect:images": "node scripts/inspect-images.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "@vercel/nft": "1.11.0",
+    "typescript": "5.9.3"
+  }
+}
